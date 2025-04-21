@@ -36,6 +36,8 @@ var (
 	// SearchMatchAnnotation is an annotation to tag secrets to be found with
 	// AutoSearchAnnotation
 	SearchMatchAnnotation = "reloader.stakater.com/match"
+	// DelayAnnotation is an annotation to specify delay before reload
+	DelayAnnotation = "reloader.stakater.com/delay"
 	// RolloutStrategyAnnotation is an annotation to define rollout update strategy
 	RolloutStrategyAnnotation = "reloader.stakater.com/rollout-strategy"
 	// LogFormat is the log format to use (json, or empty string for default)

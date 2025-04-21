@@ -152,7 +152,32 @@ This pattern allows fine-grained reload control — workloads only restart if th
 1. ✅ You want to reload a workload only if it references a ConfigMap or Secret that has been explicitly tagged with `reloader.stakater.com/match: "true"`.
 1. ✅ Use this when you want full control over which shared or system-wide resources trigger reloads. Great in multi-tenant clusters or shared configs.
 
-### 4. ⚙️ Workload-Specific Rollout Strategy
+### 4. ⏱️ Delayed Reload
+
+Delay the reload of a workload after changes are detected. Useful for batching updates or reducing cluster load.
+
+| Annotation                                | Description                                             |
+|-------------------------------------------|---------------------------------------------------------|
+| `reloader.stakater.com/delay: "30s"`     | Wait for 30 seconds before triggering the reload        |
+
+#### Supported time formats
+
+The delay value must be specified with explicit time units: `"30s"`, `"5m"`, `"2h"`, etc.
+
+#### Asynchronous processing
+
+Delayed updates are processed asynchronously:
+1. Updates with delay annotations are scheduled to run after their delay period
+2. Reloader continues processing other resources immediately
+3. Resources without delays aren't blocked by resources with longer delays
+
+#### Use when
+
+1. ✅ Coordinating changes across multiple ConfigMaps/Secrets
+2. ✅ Avoiding immediate restarts in sensitive environments
+3. ✅ Staggering restarts to reduce cluster load
+
+### 5. ⚙️ Workload-Specific Rollout Strategy
 
 By default, Reloader uses the **rollout** strategy — it updates the pod template to trigger a new rollout. This works well in most cases, but it can cause problems if you're using GitOps tools like ArgoCD, which detect this as configuration drift.
 
@@ -175,7 +200,7 @@ metadata:
 1. You want a quick restart without changing the workload spec
 1. Your platform restricts metadata changes
 
-### 5. ❗ Annotation Behavior Rules & Compatibility
+### 6. ❗ Annotation Behavior Rules & Compatibility
 
 - `reloader.stakater.com/auto` and `reloader.stakater.com/search` **cannot be used together** — the `auto` annotation takes precedence.
 - If both `auto` and its typed versions (`secret.reloader.stakater.com/auto`, `configmap.reloader.stakater.com/auto`) are used, **only one needs to be true** to trigger a reload.
@@ -184,7 +209,7 @@ metadata:
     - All workloads are treated as if they have `auto: "true"` unless they explicitly set it to `"false"`.
     - Missing or unrecognized annotation values are treated as `"false"`.
 
-### 6. 🔔 Alerting on Reload
+### 7. 🔔 Alerting on Reload
 
 Reloader can optionally **send alerts** whenever it triggers a rolling upgrade for a workload (e.g., `Deployment`, `StatefulSet`, etc.).
 
@@ -295,9 +320,9 @@ Reloader supports multiple strategies for triggering rolling updates when a watc
 | `--resources-to-ignore=secrets` | Ignore Secrets (cannot combine with configMaps) |
 | `--resource-label-selector=key=value` | Only watch ConfigMaps/Secrets with matching labels |
 
-> **⚠️ Note:**  
-> Only **one** resource type can be ignored at a time.  
-> Trying to ignore **both `configmaps` and `secrets`** will cause an error in Reloader.  
+> **⚠️ Note:**
+> Only **one** resource type can be ignored at a time.
+> Trying to ignore **both `configmaps` and `secrets`** will cause an error in Reloader.
 > ✅ **Workaround:** Scale the Reloader deployment to `0` replicas if you want to disable it completely.
 
 #### 3. 🧩 Namespace Filtering

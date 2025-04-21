@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/parnurzeal/gorequest"
 	"github.com/prometheus/client_golang/prometheus"
@@ -206,6 +207,13 @@ func rollingUpgrade(clients kube.Clients, config util.Config, upgradeFuncs callb
 	return err
 }
 
+func parseDelayTime(delayValue string) (time.Duration, bool) {
+	if duration, err := time.ParseDuration(delayValue); err == nil {
+		return duration, true
+	}
+	return 0, false
+}
+
 // PerformAction invokes the deployment if there is any change in configmap or secret data
 func PerformAction(clients kube.Clients, config util.Config, upgradeFuncs callbacks.RollingUpgradeFuncs, collectors metrics.Collectors, recorder record.EventRecorder, strategy invokeStrategy) error {
 	items := upgradeFuncs.ItemsFunc(clients, config.Namespace)
@@ -219,6 +227,7 @@ func PerformAction(clients kube.Clients, config util.Config, upgradeFuncs callba
 		typedAutoAnnotationEnabledValue, foundTypedAuto := annotations[config.TypedAutoAnnotation]
 		excludeConfigmapAnnotationValue, foundExcludeConfigmap := annotations[options.ConfigmapExcludeReloaderAnnotation]
 		excludeSecretAnnotationValue, foundExcludeSecret := annotations[options.SecretExcludeReloaderAnnotation]
+		delayValue, foundDelay := annotations[options.DelayAnnotation]
 
 		if !found && !foundAuto && !foundTypedAuto && !foundSearchAnn {
 			annotations = upgradeFuncs.PodAnnotationsFunc(i)
@@ -226,6 +235,7 @@ func PerformAction(clients kube.Clients, config util.Config, upgradeFuncs callba
 			searchAnnotationValue = annotations[options.AutoSearchAnnotation]
 			reloaderEnabledValue = annotations[options.ReloaderAutoAnnotation]
 			typedAutoAnnotationEnabledValue = annotations[config.TypedAutoAnnotation]
+			delayValue, foundDelay = annotations[options.DelayAnnotation]
 		}
 
 		isResourceExcluded := false
@@ -279,34 +289,72 @@ func PerformAction(clients kube.Clients, config util.Config, upgradeFuncs callba
 				return err
 			}
 			resourceName := accessor.GetName()
-			err = upgradeFuncs.UpdateFunc(clients, config.Namespace, i)
-			if err != nil {
-				message := fmt.Sprintf("Update for '%s' of type '%s' in namespace '%s' failed with error %v", resourceName, upgradeFuncs.ResourceType, config.Namespace, err)
-				logrus.Errorf("Update for '%s' of type '%s' in namespace '%s' failed with error %v", resourceName, upgradeFuncs.ResourceType, config.Namespace, err)
 
-				collectors.Reloaded.With(prometheus.Labels{"success": "false"}).Inc()
-				collectors.ReloadedByNamespace.With(prometheus.Labels{"success": "false", "namespace": config.Namespace}).Inc()
+			if foundDelay {
+				delay, _ := parseDelayTime(delayValue)
+				logrus.Infof("Scheduling delayed update for '%s' of type '%s' in namespace '%s' after %v", resourceName, upgradeFuncs.ResourceType, config.Namespace, delay)
+
+				itemCopy := i.DeepCopyObject()
+
+				go func(clients kube.Clients, namespace string, resourceName string, resourceType string, delay time.Duration, item runtime.Object, updateFunc func(kube.Clients, string, runtime.Object) error) {
+					time.Sleep(delay)
+
+					logrus.Infof("Executing delayed update for '%s' of type '%s' in namespace '%s'", resourceName, resourceType, namespace)
+
+					err := updateFunc(clients, namespace, item)
+					if err != nil {
+						logrus.Errorf("Delayed update for '%s' of type '%s' in namespace '%s' failed: %v", resourceName, resourceType, namespace, err)
+						return
+					}
+
+					logrus.Infof("Successfully completed delayed update for '%s' of type '%s' in namespace '%s'", resourceName, resourceType, namespace)
+
+					alert_on_reload, ok := os.LookupEnv("ALERT_ON_RELOAD")
+					if ok && alert_on_reload == "true" {
+						msg := fmt.Sprintf(
+							"Reloader completed delayed update for *%s* of type *%s* in namespace *%s* after waiting %v",
+							resourceName, resourceType, namespace, delay)
+						alert.SendWebhookAlert(msg)
+					}
+				}(clients, config.Namespace, resourceName, upgradeFuncs.ResourceType, delay, itemCopy, upgradeFuncs.UpdateFunc)
+
+				collectors.Reloaded.With(prometheus.Labels{"success": "scheduled"}).Inc()
+				collectors.ReloadedByNamespace.With(prometheus.Labels{"success": "scheduled", "namespace": config.Namespace}).Inc()
 				if recorder != nil {
-					recorder.Event(i, v1.EventTypeWarning, "ReloadFail", message)
+					message := fmt.Sprintf("Scheduled delayed update for '%s' of type '%s' in namespace '%s' after %v", resourceName, upgradeFuncs.ResourceType, config.Namespace, delay)
+					recorder.Event(i, v1.EventTypeNormal, "ReloadScheduled", message)
 				}
-				return err
 			} else {
-				message := fmt.Sprintf("Changes detected in '%s' of type '%s' in namespace '%s'", config.ResourceName, config.Type, config.Namespace)
-				message += fmt.Sprintf(", Updated '%s' of type '%s' in namespace '%s'", resourceName, upgradeFuncs.ResourceType, config.Namespace)
+				err = upgradeFuncs.UpdateFunc(clients, config.Namespace, i)
+				if err != nil {
+					message := fmt.Sprintf("Update for '%s' of type '%s' in namespace '%s' failed with error %v", resourceName, upgradeFuncs.ResourceType, config.Namespace, err)
+					logrus.Errorf("Update for '%s' of type '%s' in namespace '%s' failed with error %v", resourceName, upgradeFuncs.ResourceType, config.Namespace, err)
 
-				logrus.Infof("Changes detected in '%s' of type '%s' in namespace '%s'; updated '%s' of type '%s' in namespace '%s'", config.ResourceName, config.Type, config.Namespace, resourceName, upgradeFuncs.ResourceType, config.Namespace)
+					collectors.Reloaded.With(prometheus.Labels{"success": "false"}).Inc()
+					collectors.ReloadedByNamespace.With(prometheus.Labels{"success": "false", "namespace": config.Namespace}).Inc()
+					if recorder != nil {
+						recorder.Event(i, v1.EventTypeWarning, "ReloadFail", message)
+					}
+					return err
+				} else {
+					message := fmt.Sprintf("Changes detected in '%s' of type '%s' in namespace '%s'", config.ResourceName, config.Type, config.Namespace)
+					message += fmt.Sprintf(", Updated '%s' of type '%s' in namespace '%s'", resourceName, upgradeFuncs.ResourceType, config.Namespace)
 
-				collectors.Reloaded.With(prometheus.Labels{"success": "true"}).Inc()
-				collectors.ReloadedByNamespace.With(prometheus.Labels{"success": "true", "namespace": config.Namespace}).Inc()
-				alert_on_reload, ok := os.LookupEnv("ALERT_ON_RELOAD")
-				if recorder != nil {
-					recorder.Event(i, v1.EventTypeNormal, "Reloaded", message)
-				}
-				if ok && alert_on_reload == "true" {
-					msg := fmt.Sprintf(
-						"Reloader detected changes in *%s* of type *%s* in namespace *%s*. Hence reloaded *%s* of type *%s* in namespace *%s*",
+					logrus.Infof("Changes detected in '%s' of type '%s' in namespace '%s'; updated '%s' of type '%s' in namespace '%s'",
 						config.ResourceName, config.Type, config.Namespace, resourceName, upgradeFuncs.ResourceType, config.Namespace)
-					alert.SendWebhookAlert(msg)
+
+					collectors.Reloaded.With(prometheus.Labels{"success": "true"}).Inc()
+					collectors.ReloadedByNamespace.With(prometheus.Labels{"success": "true", "namespace": config.Namespace}).Inc()
+					alert_on_reload, ok := os.LookupEnv("ALERT_ON_RELOAD")
+					if recorder != nil {
+						recorder.Event(i, v1.EventTypeNormal, "Reloaded", message)
+					}
+					if ok && alert_on_reload == "true" {
+						msg := fmt.Sprintf(
+							"Reloader detected changes in *%s* of type *%s* in namespace *%s*. Hence reloaded *%s* of type *%s* in namespace *%s*",
+							config.ResourceName, config.Type, config.Namespace, resourceName, upgradeFuncs.ResourceType, config.Namespace)
+						alert.SendWebhookAlert(msg)
+					}
 				}
 			}
 		}
